@@ -14,22 +14,22 @@ def get_grid_cell(x, y, width, height, class_id):
     return grid_x, grid_y, x, y, width, height, class_id
 
 
-# New loss function
+
 def detection_loss(output, target):
 
-    # Box coordinates
+    
     box_loss = torch.nn.functional.mse_loss(
         output[:, 0:4],
         target[:, 0:4]
     )
 
-    # Objectness
+    
     objectness_loss = torch.nn.functional.binary_cross_entropy_with_logits(
         output[:, 4],
         target[:, 4]
     )
 
-    # Classes
+    
     class_loss = torch.nn.functional.binary_cross_entropy_with_logits(
         output[:, 5:10],
         target[:, 5:10]
@@ -58,7 +58,7 @@ loss_function = detection_loss
 start_time = time.time()
 
 
-# Training loop
+
 for epoch in range(10):
 
     total_loss = 0

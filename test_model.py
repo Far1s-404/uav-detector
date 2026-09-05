@@ -33,10 +33,10 @@ with torch.no_grad():
 print("Output shape:", output.shape)
 
 
-# Get predictions for the first image
+
 prediction = output[0]
 
-# Find the grid cell with the highest objectness
+
 objectness = prediction[4]
 
 max_value, max_index = torch.max(objectness.view(-1), dim=0)

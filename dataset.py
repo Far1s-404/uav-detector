@@ -3,13 +3,8 @@ from PIL import Image
 import torch
 from torch.utils.data import Dataset
 from torchvision import transforms
-from torch.utils.data import DataLoader
 
 DATASET_PATH = Path("D:/uav_detector/archive")
-
-IMAGE_PATH = DATASET_PATH / "images" / "train"
-LABEL_PATH = DATASET_PATH / "labels" / "train"
-
 IMAGE_SIZE = 640
 
 def collate_fn(batch):
@@ -20,76 +15,67 @@ def collate_fn(batch):
         images.append(image)
         labels.append(label)
 
-    images = torch.stack(images)
-
+    images = torch.stack(images, dim=0)
     return images, labels
 
 class DroneDataset(Dataset):
-
     def __init__(self, split="train"):
+        self.image_dir = DATASET_PATH / "images" / split
+        self.label_dir = DATASET_PATH / "labels" / split
+        self.split = split
 
-        image_path = DATASET_PATH / "images" / split
-        label_path = DATASET_PATH / "labels" / split
+        # --- THE SPLIT AUGMENTATION PIPELINE ---
+        if self.split == "train":
+            # Training: Aggressive pixel distortion to prevent overfitting
+            self.transforms = transforms.Compose([
+                transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
+                transforms.ColorJitter(brightness=0.2, contrast=0.5, saturation=0.5, hue=0.2),
+                transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0)), 
+                transforms.ToTensor(),
+            ])
+        else:
+            # Validation: Untouched and clean for honest scoring
+            self.transforms = transforms.Compose([
+                transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
+                transforms.ToTensor(),
+            ])
 
-        self.images = list(image_path.glob("*.jpg"))
-        self.label_path = label_path
+        valid_extensions = {".jpg", ".jpeg", ".png", ".bmp"}
+        self.images = [
+            p for p in self.label_dir.parent.parent.glob(f"images/{split}/*")
+            if p.suffix.lower() in valid_extensions
+        ]
 
     def __len__(self):
         return len(self.images)
 
     def __getitem__(self, index):
-
         image_path = self.images[index]
 
-        # Load image && resize (bn3ml resize to image and boundary box too )
         image = Image.open(image_path).convert("RGB")
-        original_width, original_height = image.size
-        image = image.resize((IMAGE_SIZE, IMAGE_SIZE))
-        image = transforms.ToTensor()(image)
+        
+        # Apply the correct transforms based on the split
+        image_tensor = self.transforms(image)
 
-
-        # Find corresponding label
-        label_path = self.label_path / (image_path.stem + ".txt")
-
+        label_file = self.label_dir / f"{image_path.stem}.txt"
         labels = []
 
-        with open(label_path, "r") as f:
-            for line in f:
-                values = line.strip().split()
+        if label_file.exists():
+            with open(label_file, "r") as f:
+                for line in f:
+                    values = line.strip().split()
+                    if len(values) >= 5:
+                        labels.append([
+                            float(values[0]),  
+                            float(values[1]),  
+                            float(values[2]),  
+                            float(values[3]),  
+                            float(values[4])   
+                        ])
 
-                class_id = int(values[0])
-                x = float(values[1])
-                y = float(values[2])
-                width = float(values[3])
-                height = float(values[4])
+        if len(labels) == 0:
+            labels_tensor = torch.zeros((0, 5), dtype=torch.float32)
+        else:
+            labels_tensor = torch.tensor(labels, dtype=torch.float32)
 
-                labels.append([
-                    class_id,
-                    x,
-                    y,
-                    width,
-                    height
-                ])
-
-        return image, torch.tensor(labels, dtype=torch.float32)
-
-
-dataset = DroneDataset()
-
-dataloader = DataLoader(
-    dataset,
-    batch_size=4,
-    shuffle=True,
-    num_workers=0,
-    collate_fn=collate_fn
-)
-images, labels = next(iter(dataloader))
-print("Batch image shape:", images.shape)
-print("Number of labels:", len(labels))
-print("Number of images:", len(dataset))
-
-image, labels = dataset[0]
-
-print("Image tensor shape:", image.shape)
-print("Labels:")
-print(labels)
+        return image_tensor, labels_tensor

@@ -1,48 +1,57 @@
+import torch
 import torch.nn as nn
 
-
 class DroneDetector(nn.Module):
-
-    def __init__(self):
+    def __init__(self, num_classes=5):
         super().__init__()
 
-        self.conv1 = nn.Conv2d(3, 16, 3, padding=1)
-        self.relu1 = nn.ReLU()
-        self.pool1 = nn.MaxPool2d(2,2)
+        # --- THE TRAP: Ensures this file is actually being loaded! ---
+        print("\n SUCCESS: LOADING THE NEW BACKBONE ARCHITECTURE! \n")
 
-        self.conv2= nn.Conv2d(16, 32, 3, padding=1)
-        self.relu2 = nn.ReLU()
-        self.pool2 = nn.MaxPool2d(2,2)
+        # Feature Extractor (Downsamples 8x via 3 MaxPool layers)
+        self.backbone = nn.Sequential(
+            nn.Conv2d(3, 16, kernel_size=3, padding=1),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2, 2),
 
-        self.conv3= nn.Conv2d(32, 64, 3, padding=1)
-        self.relu3 = nn.ReLU()
-        self.pool3 = nn.MaxPool2d(2,2)
+            nn.Conv2d(16, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2, 2),
 
-        self.conv4= nn.Conv2d(64, 128, 3, padding=1)
-        self.relu4 = nn.ReLU()
-        self.pool4 = nn.MaxPool2d(2,2)
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2, 2)
+            
+            #nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            #nn.BatchNorm2d(128),
+            #nn.ReLU(inplace=True),
+            #nn.MaxPool2d(2, 2)
+        )
 
-        self.detect = nn.Conv2d(128, 10, 1)
+        # Decoupled Localization Head: outputs [tx, ty, tw, th] in [0, 1]
+        # UPDATED: Input channels changed from 128 to 64
+        self.bbox_head = nn.Sequential(
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 4, kernel_size=1),
+            nn.Sigmoid()
+        )
 
-    def forward(self,x):
-        x = self.conv1(x)
-        x = self.relu1(x)
-        x = self.pool1(x)
+        # Decoupled Classification & Objectness Head: outputs raw logits [conf, class_1, ...]
+        # UPDATED: Input channels changed from 128 to 64
+        self.cls_head = nn.Sequential(
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 1 + num_classes, kernel_size=1)
+        )
 
-        x = self.conv2(x)
-        x = self.relu2(x)
-        x = self.pool2(x)
-
-        x = self.conv3(x)
-        x = self.relu3(x)
-        x = self.pool3(x)
-
-        x = self.conv4(x)
-        x = self.relu4(x)
-        x = self.pool4(x)
-
-        x = self.detect(x)
-
-        return x; 
-
+    def forward(self, x):
+        features = self.backbone(x)
+        bbox_preds = self.bbox_head(features)
+        cls_preds = self.cls_head(features)
         
+        # Concatenate along channel dimension: [B, 4 + 1 + num_classes, H, W]
+        return torch.cat([bbox_preds, cls_preds], dim=1)

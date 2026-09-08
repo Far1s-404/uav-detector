@@ -1,112 +1,156 @@
 import torch
+import torch.nn.functional as F
 import time
+from pathlib import Path
 from model import DroneDetector
-from dataset import DroneDataset, DataLoader, collate_fn
+from dataset import DroneDataset, collate_fn
+from torch.utils.data import DataLoader
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-print("Using device:", device)
-
-def get_grid_cell(x, y, width, height, class_id):
-    grid_x = int(x * 40)
-    grid_y = int(y * 40)
-
-    return grid_x, grid_y, x, y, width, height, class_id
-
-
+def get_grid_cell(x, y, width, height, class_id, grid_w, grid_h):
+    x = min(max(float(x), 0.0), 0.999999)
+    y = min(max(float(y), 0.0), 0.999999)
+    grid_x = int(x * grid_w)
+    grid_y = int(y * grid_h)
+    cell_x = (x * grid_w) - grid_x
+    cell_y = (y * grid_h) - grid_y
+    return grid_x, grid_y, cell_x, cell_y, width, height, class_id
 
 def detection_loss(output, target):
+    pred_boxes = output[:, 0:4]
+    target_boxes = target[:, 0:4]
+    object_mask = target[:, 4:5] 
 
+    box_loss = F.smooth_l1_loss(pred_boxes, target_boxes, reduction="none")
+    box_loss = (box_loss * object_mask).sum() / (object_mask.sum() * 4 + 1e-6)
+
+    objectness_loss = F.binary_cross_entropy_with_logits(
+        output[:, 4], target[:, 4], reduction="none"
+    )
+    objectness_weight = torch.where(
+        target[:, 4] == 1,
+        torch.tensor(10.0, device=target.device),
+        torch.tensor(5.0, device=target.device),
+    )
+    objectness_loss = (objectness_loss * objectness_weight).mean()
+
+    class_loss = F.binary_cross_entropy_with_logits(
+        output[:, 5:10], target[:, 5:10], reduction="none"
+    )
+    class_loss = (class_loss * object_mask).sum() / (object_mask.sum() * 5 + 1e-6)
+
+    return (5.0 * box_loss) + objectness_loss + class_loss
+
+def main():
+    print(f"Initializing training on: {device}")
     
-    box_loss = torch.nn.functional.mse_loss(
-        output[:, 0:4],
-        target[:, 0:4]
+    train_dataset = DroneDataset(split="train")
+    val_dataset = DroneDataset(split="val")
+
+    train_loader = DataLoader(
+        train_dataset, batch_size=32, shuffle=True, 
+        num_workers=4, collate_fn=collate_fn, pin_memory=True
+    )
+    val_loader = DataLoader(
+        val_dataset, batch_size=32, shuffle=False, 
+        num_workers=4, collate_fn=collate_fn, pin_memory=True
     )
 
+    model = DroneDetector(num_classes=5).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.0005)
+
+    # --- MARATHON RUN CONFIGURATION ---
+    epochs = 50
+    best_val_loss = float('inf')
     
-    objectness_loss = torch.nn.functional.binary_cross_entropy_with_logits(
-        output[:, 4],
-        target[:, 4]
-    )
+    output_dir = Path("D:/uav_detector/weights")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    best_model_path = output_dir / "best_drone_detector.pth"
 
-    
-    class_loss = torch.nn.functional.binary_cross_entropy_with_logits(
-        output[:, 5:10],
-        target[:, 5:10]
-    )
+    print(f"Training Images: {len(train_dataset)} | Validation Images: {len(val_dataset)}")
+    total_start_time = time.time()
 
-    loss = box_loss + objectness_loss + class_loss
+    for epoch in range(epochs):
+        epoch_start_time = time.time()
+        
+        # --- TRAINING PHASE ---
+        model.train()
+        train_loss = 0.0
 
-    return loss
+        for batch_index, (images, labels) in enumerate(train_loader):
+            batch_start_time = time.time() # Start the batch timer
+            
+            images = images.to(device)
+            output = model(images)
+            batch_size, _, grid_h, grid_w = output.shape
+            target = torch.zeros(batch_size, 10, grid_h, grid_w, device=device)
 
+            # --- CPU TARGET BUILDER ---
+            for i in range(len(labels)):
+                for item in labels[i]:
+                    class_id, x, y, width, height = item
+                    gx, gy, cx, cy, w, h, cid = get_grid_cell(x, y, width, height, class_id, grid_w, grid_h)
+                    target[i, 0, gy, gx] = cx
+                    target[i, 1, gy, gx] = cy
+                    target[i, 2, gy, gx] = min(max(float(w), 0.0), 1.0)
+                    target[i, 3, gy, gx] = min(max(float(h), 0.0), 1.0)
+                    target[i, 4, gy, gx] = 1.0
+                    target[i, 5 + int(cid), gy, gx] = 1.0
+            # -------------------------------------------------------------
 
-dataset = DroneDataset()
+            loss = detection_loss(output, target)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
 
-dataloader = DataLoader(
-    dataset,
-    batch_size=4,
-    shuffle=True,
-    num_workers=0,
-    collate_fn=collate_fn
-)
+            batch_duration = time.time() - batch_start_time # Stop the batch timer
 
-model = DroneDetector().to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=0.001) #Adam:the optimization algorithm., lr = learning rate , model parameters = parameters to update
+            if batch_index % 10 == 0:
+                print(f"  -> Processing Batch [{batch_index}/{len(train_loader)}] | Current Loss: {loss.item():.4f} | Time: {batch_duration:.3f}s")
 
-loss_function = detection_loss
+        avg_train_loss = train_loss / len(train_loader)
 
-start_time = time.time()
+        # --- VALIDATION PHASE ---
+        model.eval()
+        val_loss = 0.0
 
+        with torch.no_grad():
+            for images, labels in val_loader:
+                images = images.to(device)
+                output = model(images)
+                batch_size, _, grid_h, grid_w = output.shape
+                target = torch.zeros(batch_size, 10, grid_h, grid_w, device=device)
 
+                for i in range(len(labels)):
+                    for item in labels[i]:
+                        class_id, x, y, width, height = item
+                        gx, gy, cx, cy, w, h, cid = get_grid_cell(x, y, width, height, class_id, grid_w, grid_h)
+                        target[i, 0, gy, gx] = cx
+                        target[i, 1, gy, gx] = cy
+                        target[i, 2, gy, gx] = min(max(float(w), 0.0), 1.0)
+                        target[i, 3, gy, gx] = min(max(float(h), 0.0), 1.0)
+                        target[i, 4, gy, gx] = 1.0
+                        target[i, 5 + int(cid), gy, gx] = 1.0
 
-for epoch in range(10):
+                v_loss = detection_loss(output, target)
+                val_loss += v_loss.item()
 
-    total_loss = 0
+        avg_val_loss = val_loss / len(val_loader)
+        epoch_duration = time.time() - epoch_start_time
+        mins, secs = divmod(epoch_duration, 60)
 
-    for batch_index, (images, labels) in enumerate(dataloader):
+        print(f"Epoch [{epoch+1}/{epochs}] | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | Time: {int(mins)}m {int(secs)}s")
 
-        images = images.to(device)
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            torch.save(model.state_dict(), best_model_path)
+            print(f"   [+] New best model saved! (Val Loss: {best_val_loss:.4f})")
 
-        output = model(images)
+    total_time = (time.time() - total_start_time) / 60
+    print(f"\nTraining complete in {total_time:.2f} minutes.")
+    print(f"Best weights saved to: {best_model_path}")
 
-        target = torch.zeros(images.size(0), 10, 40, 40).to(device)
-
-        for image_index in range(len(labels)):
-
-            for item in labels[image_index]:
-
-                class_id, x, y, width, height = item
-
-                grid_x, grid_y, x, y, width, height, class_id = get_grid_cell(
-                    x, y, width, height, class_id
-                )
-
-                target[image_index, 0, grid_y, grid_x] = x
-                target[image_index, 1, grid_y, grid_x] = y
-                target[image_index, 2, grid_y, grid_x] = width
-                target[image_index, 3, grid_y, grid_x] = height
-                target[image_index, 4, grid_y, grid_x] = 1
-
-                target[image_index, 5 + int(class_id), grid_y, grid_x] = 1
-
-        loss = loss_function(output, target)
-
-        optimizer.zero_grad() # clear old gradients
-        loss.backward()       # calculate how each weight contributed to the error
-        optimizer.step()      # update the weights
-
-        total_loss += loss.item()
-
-        if batch_index % 100 == 0:
-            print("Batch:", batch_index, "Loss:", loss.item())
-
-    print("Epoch:", epoch + 1, "Loss:", total_loss / len(dataloader))
-
-
-end_time = time.time()
-training_time = end_time - start_time
-
-print("Training time:", training_time / 60, "minutes")
-
-torch.save(model.state_dict(), "drone_detector.pth")
-print("Model saved as drone_detector.pth")
+if __name__ == "__main__":
+    main()

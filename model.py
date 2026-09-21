@@ -1,57 +1,95 @@
 import torch
 import torch.nn as nn
 
+
+class ConvBlock(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+
+        self.block = nn.Sequential(
+            nn.Conv2d(
+                in_channels,
+                out_channels,
+                kernel_size=3,
+                padding=1,
+                bias=False
+            ),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x):
+        return self.block(x)
+
+
 class DroneDetector(nn.Module):
     def __init__(self, num_classes=5):
         super().__init__()
 
-        # --- THE TRAP: Ensures this file is actually being loaded! ---
-        print("\n SUCCESS: LOADING THE NEW BACKBONE ARCHITECTURE! \n")
+        print("\nSUCCESS: LOADING CUSTOM 8-CONV DRONE DETECTOR\n")
 
-        # Feature Extractor (Downsamples 8x via 3 MaxPool layers)
-        self.backbone = nn.Sequential(
-            nn.Conv2d(3, 16, kernel_size=3, padding=1),
-            nn.BatchNorm2d(16),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2, 2),
+        
+        # BACKBONE
+        #
+        # 1280 -> 640 -> 320 -> 160
+        #
+        # We deliberately DO NOT downsample below 160x160.
+        # This preserves information about tiny drones.
+        
 
-            nn.Conv2d(16, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2, 2),
-
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
+        self.stage1 = nn.Sequential(
+            ConvBlock(3, 32),
+            ConvBlock(32, 32),
             nn.MaxPool2d(2, 2)
-            
-            #nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            #nn.BatchNorm2d(128),
-            #nn.ReLU(inplace=True),
-            #nn.MaxPool2d(2, 2)
         )
 
-        # Decoupled Localization Head: outputs [tx, ty, tw, th] in [0, 1]
-        # UPDATED: Input channels changed from 128 to 64
-        self.bbox_head = nn.Sequential(
-            nn.Conv2d(64, 64, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(64, 4, kernel_size=1),
-            nn.Sigmoid()
+        self.stage2 = nn.Sequential(
+            ConvBlock(32, 64),
+            ConvBlock(64, 64),
+            nn.MaxPool2d(2, 2)
         )
 
-        # Decoupled Classification & Objectness Head: outputs raw logits [conf, class_1, ...]
-        # UPDATED: Input channels changed from 128 to 64
-        self.cls_head = nn.Sequential(
-            nn.Conv2d(64, 64, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(64, 1 + num_classes, kernel_size=1)
+        self.stage3 = nn.Sequential(
+            ConvBlock(64, 128),
+            ConvBlock(128, 128),
+            nn.MaxPool2d(2, 2)
+        )
+
+        self.stage4 = nn.Sequential(
+            ConvBlock(128, 256),
+            ConvBlock(256, 256)
+        )
+
+        
+        # DETECTION HEAD
+        #
+        # Output:
+        # 0: tx
+        # 1: ty
+        # 2: width
+        # 3: height
+        # 4: objectness
+        # 5...: class probabilities
+        #
+        # Total = 4 + 1 + num_classes
+        
+
+        output_channels = 5 + num_classes
+
+        self.head = nn.Sequential(
+            ConvBlock(256, 256),
+            nn.Conv2d(
+                256,
+                output_channels,
+                kernel_size=1
+            )
         )
 
     def forward(self, x):
-        features = self.backbone(x)
-        bbox_preds = self.bbox_head(features)
-        cls_preds = self.cls_head(features)
-        
-        # Concatenate along channel dimension: [B, 4 + 1 + num_classes, H, W]
-        return torch.cat([bbox_preds, cls_preds], dim=1)
+        x = self.stage1(x)   # 1280 -> 640
+        x = self.stage2(x)   # 640 -> 320
+        x = self.stage3(x)   # 320 -> 160
+        x = self.stage4(x)   # remains 160
+
+        return self.head(x)
+    

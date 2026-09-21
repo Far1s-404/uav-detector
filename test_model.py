@@ -1,41 +1,13 @@
-import torch
-import cv2
-import torchvision.ops as ops
+import time
 from pathlib import Path
 
+import torch
+import torch.nn.functional as F
+
+from torch.utils.data import DataLoader
+
 from model import DroneDetector
-
-
-# ============================================================
-# CONFIGURATION
-# ============================================================
-
-INPUT_PATH = Path(
-    "D:/uav_detector/archive/videos/generate_a_video_of_a_drone_fl.mp4"
-)
-
-OUTPUT_DIR = Path(
-    "D:\\uav_detector\\deep_cv_model\\results"
-)
-
-WEIGHTS_PATH = Path(
-    "D:\\uav_detector\\weights\\best_drone_detector.pth"
-)
-
-NUM_CLASSES = 5
-
-CLASS_NAMES = [
-    "shahed_136",
-    "shahed_238",
-    "mq9_reaper",
-    "dji_mavic",
-    "mohajer_6"
-]
-
-CONFIDENCE_THRESHOLD = 0.40
-IOU_THRESHOLD = 0.30
-IMAGE_SIZE = 1280
-BOX_SCALE = 0.10
+from dataset import DroneDataset, collate_fn
 
 
 # ============================================================
@@ -46,11 +18,7 @@ device = torch.device(
     "cuda" if torch.cuda.is_available() else "cpu"
 )
 
-print("=" * 60)
-print("DRONE DETECTOR")
-print("=" * 60)
-
-print(f"Device: {device}")
+print(f"\nTraining device: {device}")
 
 if torch.cuda.is_available():
 
@@ -58,678 +26,764 @@ if torch.cuda.is_available():
         f"GPU: {torch.cuda.get_device_name(0)}"
     )
 
-
-# ============================================================
-# CHECK MODEL
-# ============================================================
-
-if not WEIGHTS_PATH.exists():
-
     print(
-        f"\nERROR: Model weights not found:\n"
-        f"{WEIGHTS_PATH}"
+        f"VRAM: "
+        f"{torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB"
     )
 
-    raise SystemExit
-
 
 # ============================================================
-# LOAD MODEL
+# CONFIGURATION
 # ============================================================
 
-print("\nLoading model...")
+NUM_CLASSES = 5
 
-model = DroneDetector(
-    num_classes=NUM_CLASSES
-).to(device)
+BATCH_SIZE = 4
 
-checkpoint = torch.load(
-    WEIGHTS_PATH,
-    map_location=device
+EPOCHS = 200
+
+LEARNING_RATE = 0.0005
+
+NUM_WORKERS = 4
+
+OUTPUT_DIR = Path(
+    "D:/uav_detector/weights"
 )
-
-if "model_state_dict" in checkpoint:
-
-    model.load_state_dict(
-        checkpoint["model_state_dict"]
-    )
-
-else:
-
-    model.load_state_dict(
-        checkpoint
-    )
-
-model.eval()
-
-print("Model loaded successfully!")
-
-
-# ============================================================
-# CREATE OUTPUT DIRECTORY
-# ============================================================
 
 OUTPUT_DIR.mkdir(
     parents=True,
     exist_ok=True
 )
 
+BEST_MODEL_PATH = (
+    OUTPUT_DIR /
+    "best_drone_detector.pth"
+)
 
-# ============================================================
-# IMAGE EXTENSIONS
-# ============================================================
-
-IMAGE_EXTENSIONS = {
-    ".jpg",
-    ".jpeg",
-    ".png",
-    ".bmp",
-    ".webp"
-}
+LAST_MODEL_PATH = (
+    OUTPUT_DIR /
+    "last_drone_detector.pth"
+)
 
 
 # ============================================================
-# VIDEO EXTENSIONS
+# TARGET BUILDER
 # ============================================================
 
-VIDEO_EXTENSIONS = {
-    ".mp4",
-    ".avi",
-    ".mov",
-    ".mkv",
-    ".wmv"
-}
+def build_targets(labels, batch_size, grid_h, grid_w, device):
 
-
-# ============================================================
-# DETECTION FUNCTION
-# ============================================================
-
-def detect_frame(frame):
-
-    original_height, original_width = frame.shape[:2]
-
-    resized = cv2.resize(
-        frame,
-        (IMAGE_SIZE, IMAGE_SIZE),
-        interpolation=cv2.INTER_LINEAR
+    target = torch.zeros(
+        batch_size,
+        5 + NUM_CLASSES,
+        grid_h,
+        grid_w,
+        device=device
     )
 
-    rgb = cv2.cvtColor(
-        resized,
-        cv2.COLOR_BGR2RGB
-    )
+    for batch_index in range(len(labels)):
 
-    tensor = (
-        torch.from_numpy(rgb)
-        .permute(2, 0, 1)
-        .float()
-        / 255.0
-    )
+        for item in labels[batch_index]:
 
-    tensor = tensor.unsqueeze(0).to(device)
+            class_id = int(item[0])
 
-    with torch.no_grad():
+            x = float(item[1])
+            y = float(item[2])
+            width = float(item[3])
+            height = float(item[4])
 
-        output = model(tensor)
+            # ------------------------------------------------
+            # Clamp normalized coordinates
+            # ------------------------------------------------
 
-    prediction = output[0]
+            x = min(max(x, 0.0), 0.999999)
+            y = min(max(y, 0.0), 0.999999)
 
-    _, grid_h, grid_w = prediction.shape
+            width = min(max(width, 0.0), 1.0)
+            height = min(max(height, 0.0), 1.0)
 
-    objectness = torch.sigmoid(
-        prediction[4]
-    )
+            # ------------------------------------------------
+            # Find grid cell
+            # ------------------------------------------------
 
-    mask = (
-        objectness >
-        CONFIDENCE_THRESHOLD
-    )
+            gx = min(
+                int(x * grid_w),
+                grid_w - 1
+            )
 
-    ys, xs = torch.where(mask)
+            gy = min(
+                int(y * grid_h),
+                grid_h - 1
+            )
 
-    boxes = []
-    scores = []
-    class_ids = []
+            # ------------------------------------------------
+            # Position INSIDE the cell
+            # ------------------------------------------------
 
-    for gy_tensor, gx_tensor in zip(
-        ys,
-        xs
-    ):
+            cell_x = (
+                x * grid_w
+            ) - gx
 
-        gy = gy_tensor.item()
-        gx = gx_tensor.item()
+            cell_y = (
+                y * grid_h
+            ) - gy
 
-        confidence = objectness[
-            gy,
-            gx
-        ].item()
+            # ------------------------------------------------
+            # If multiple objects land in same cell,
+            # keep the first one.
+            #
+            # This architecture supports one object per cell.
+            # ------------------------------------------------
 
-        bbox = torch.sigmoid(
-            prediction[
-                0:4,
+            if target[
+                batch_index,
+                4,
                 gy,
                 gx
-            ]
-        )
+            ] == 1:
 
-        cell_x = bbox[0].item()
-        cell_y = bbox[1].item()
+                continue
 
-        norm_w = bbox[2].item()
-        norm_h = bbox[3].item()
+            # ------------------------------------------------
+            # Bounding box
+            # ------------------------------------------------
 
-        norm_cx = (
-            gx + cell_x
-        ) / grid_w
+            target[
+                batch_index,
+                0,
+                gy,
+                gx
+            ] = cell_x
 
-        norm_cy = (
-            gy + cell_y
-        ) / grid_h
+            target[
+                batch_index,
+                1,
+                gy,
+                gx
+            ] = cell_y
 
-        norm_cx = min(
-            max(norm_cx, 0.0),
-            1.0
-        )
+            target[
+                batch_index,
+                2,
+                gy,
+                gx
+            ] = width
 
-        norm_cy = min(
-            max(norm_cy, 0.0),
-            1.0
-        )
+            target[
+                batch_index,
+                3,
+                gy,
+                gx
+            ] = height
 
-        norm_w = min(
-            max(norm_w, 0.0),
-            1.0
-        )
+            # ------------------------------------------------
+            # Objectness
+            # ------------------------------------------------
 
-        norm_h = min(
-            max(norm_h, 0.0),
-            1.0
-        )
+            target[
+                batch_index,
+                4,
+                gy,
+                gx
+            ] = 1.0
 
-        center_x = int(
-            norm_cx *
-            original_width
-        )
+            # ------------------------------------------------
+            # Class
+            # ------------------------------------------------
 
-        center_y = int(
-            norm_cy *
-            original_height
-        )
+            if 0 <= class_id < NUM_CLASSES:
 
-        box_w = int(
-            norm_w *
-            original_width *
-            BOX_SCALE
-        )
+                target[
+                    batch_index,
+                    5 + class_id,
+                    gy,
+                    gx
+                ] = 1.0
 
-        box_h = int(
-            norm_h *
-            original_height *
-            BOX_SCALE
-        )
+    return target
 
-        x1 = max(
-            0,
-            center_x - box_w // 2
-        )
 
-        y1 = max(
-            0,
-            center_y - box_h // 2
-        )
+# ============================================================
+# LOSS
+# ============================================================
 
-        x2 = min(
-            original_width - 1,
-            center_x + box_w // 2
-        )
+def detection_loss(output, target):
 
-        y2 = min(
-            original_height - 1,
-            center_y + box_h // 2
-        )
+    # --------------------------------------------------------
+    # Predictions
+    # --------------------------------------------------------
 
-        if x2 <= x1 or y2 <= y1:
-            continue
+    pred_boxes = output[:, 0:4]
 
-        class_logits = prediction[
-            5:5 + NUM_CLASSES,
-            gy,
-            gx
-        ]
+    pred_objectness = output[:, 4]
 
-        class_id = torch.argmax(
-            class_logits
-        ).item()
+    pred_classes = output[:, 5:]
 
-        boxes.append([
-            x1,
-            y1,
-            x2,
-            y2
-        ])
+    # --------------------------------------------------------
+    # Targets
+    # --------------------------------------------------------
 
-        scores.append(
-            confidence
-        )
+    target_boxes = target[:, 0:4]
 
-        class_ids.append(
-            class_id
-        )
+    target_objectness = target[:, 4]
+
+    target_classes = target[:, 5:]
+
+    # --------------------------------------------------------
+    # Object mask
+    # --------------------------------------------------------
+
+    object_mask = (
+        target_objectness == 1
+    )
+
+    object_mask_float = object_mask.float()
+
+    num_objects = (
+        object_mask_float.sum()
+        .clamp(min=1.0)
+    )
 
     # ========================================================
-    # NON-MAXIMUM SUPPRESSION
+    # BOX LOSS
     # ========================================================
 
-    if len(boxes) > 0:
+    if object_mask.any():
 
-        boxes_tensor = torch.tensor(
-            boxes,
-            dtype=torch.float32
+        box_loss = F.smooth_l1_loss(
+            pred_boxes,
+            target_boxes,
+            reduction="none"
         )
 
-        scores_tensor = torch.tensor(
-            scores,
-            dtype=torch.float32
+        # [B, 4, H, W]
+        box_loss = (
+            box_loss *
+            object_mask_float.unsqueeze(1)
+        ).sum()
+
+        box_loss = (
+            box_loss /
+            (num_objects * 4.0)
         )
 
-        class_tensor = torch.tensor(
-            class_ids,
-            dtype=torch.int64
-        )
-
-        keep = ops.batched_nms(
-            boxes_tensor,
-            scores_tensor,
-            class_tensor,
-            IOU_THRESHOLD
-        )
-
-        for index in keep:
-
-            index = index.item()
-
-            x1, y1, x2, y2 = (
-                boxes[index]
-            )
-
-            confidence = scores[index]
-
-            class_id = class_ids[index]
-
-            if class_id < NUM_CLASSES:
-
-                class_name = (
-                    CLASS_NAMES[class_id]
-                )
-
-            else:
-
-                class_name = (
-                    f"class_{class_id}"
-                )
-
-            cv2.rectangle(
-                frame,
-                (int(x1), int(y1)),
-                (int(x2), int(y2)),
-                (0, 255, 0),
-                2
-            )
-
-            label = (
-                f"{class_name} "
-                f"{confidence:.2f}"
-            )
-
-            text_y = max(
-                int(y1) - 10,
-                25
-            )
-
-            cv2.putText(
-                frame,
-                label,
-                (int(x1), text_y),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (0, 255, 0),
-                2
-            )
-
-    return frame
-
-
-# ============================================================
-# PROCESS SINGLE IMAGE
-# ============================================================
-
-def process_image(image_path):
-
-    print(
-        f"\nProcessing image: "
-        f"{image_path.name}"
-    )
-
-    frame = cv2.imread(
-        str(image_path)
-    )
-
-    if frame is None:
-
-        print(
-            "ERROR: Could not read image."
-        )
-
-        return
-
-    result = detect_frame(frame)
-
-    output_path = (
-        OUTPUT_DIR /
-        image_path.name
-    )
-
-    cv2.imwrite(
-        str(output_path),
-        result
-    )
-
-    print(
-        f"Saved: {output_path}"
-    )
-
-
-# ============================================================
-# PROCESS IMAGE FOLDER
-# ============================================================
-
-def process_image_folder(folder_path):
-
-    image_files = sorted(
-        [
-            file
-            for file in folder_path.iterdir()
-            if file.is_file()
-            and file.suffix.lower()
-            in IMAGE_EXTENSIONS
-        ]
-    )
-
-    if len(image_files) == 0:
-
-        print(
-            "\nNo images found in folder."
-        )
-
-        return
-
-    print(
-        f"\nFound {len(image_files)} images."
-    )
-
-    print(
-        "Starting image detection...\n"
-    )
-
-    for number, image_path in enumerate(
-        image_files,
-        start=1
-    ):
-
-        print(
-            f"[{number}/{len(image_files)}] "
-            f"{image_path.name}"
-        )
-
-        process_image(
-            image_path
-        )
-
-    print(
-        "\nAll images processed!"
-    )
-
-
-# ============================================================
-# PROCESS VIDEO
-# ============================================================
-
-def process_video(video_path):
-    if torch.cuda.is_available():
-
-        print(
-            f"GPU: {torch.cuda.get_device_name(0)}"
-        )
     else:
-        print("running on CPU")
-        
 
-    video_path = Path(video_path)
+        box_loss = torch.tensor(
+            0.0,
+            device=output.device
+        )
+
+    # ========================================================
+    # OBJECTNESS LOSS
+    # ========================================================
+
+    # Positive cells receive stronger weight.
+    #
+    # This is important because almost all 160x160 cells
+    # contain background.
+    # ========================================================
+
+    positive_weight = 10.0
+    negative_weight = 1.0
+
+    objectness_weights = torch.where(
+        target_objectness == 1,
+        torch.full_like(
+            target_objectness,
+            positive_weight
+        ),
+        torch.full_like(
+            target_objectness,
+            negative_weight
+        )
+    )
+
+    objectness_loss = F.binary_cross_entropy_with_logits(
+        pred_objectness,
+        target_objectness,
+        weight=objectness_weights,
+        reduction="mean"
+    )
+
+    # ========================================================
+    # CLASS LOSS
+    # ========================================================
+
+    if object_mask.any():
+
+        class_loss = F.binary_cross_entropy_with_logits(
+            pred_classes,
+            target_classes,
+            reduction="none"
+        )
+
+        class_loss = (
+            class_loss *
+            object_mask_float.unsqueeze(1)
+        ).sum()
+
+        class_loss = (
+            class_loss /
+            (num_objects * NUM_CLASSES)
+        )
+
+    else:
+
+        class_loss = torch.tensor(
+            0.0,
+            device=output.device
+        )
+
+    # ========================================================
+    # TOTAL
+    # ========================================================
+
+    total_loss = (
+        5.0 * box_loss
+        + objectness_loss
+        + class_loss
+    )
+
+    return total_loss, box_loss, objectness_loss, class_loss
+
+
+# ============================================================
+# TRAINING
+# ============================================================
+
+def main():
+
+    print("\n======================================")
+    print(" CUSTOM UAV DETECTOR TRAINING")
+    print("======================================")
+
+    # --------------------------------------------------------
+    # DATASETS
+    # --------------------------------------------------------
+
+    train_dataset = DroneDataset(
+        split="train"
+    )
+
+    val_dataset = DroneDataset(
+        split="val"
+    )
 
     print(
-        f"\nProcessing video: "
-        f"{video_path.name}"
+        f"\nTraining images: "
+        f"{len(train_dataset)}"
     )
 
-    cap = cv2.VideoCapture(
-        str(video_path)
+    print(
+        f"Validation images: "
+        f"{len(val_dataset)}"
     )
 
-    if not cap.isOpened():
+    # --------------------------------------------------------
+    # DATA LOADERS
+    # --------------------------------------------------------
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=NUM_WORKERS,
+        collate_fn=collate_fn,
+        pin_memory=True,
+        persistent_workers=True
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+        collate_fn=collate_fn,
+        pin_memory=True,
+        persistent_workers=True
+    )
+
+    # --------------------------------------------------------
+    # MODEL
+    # --------------------------------------------------------
+
+    model = DroneDetector(
+        num_classes=NUM_CLASSES
+    ).to(device)
+
+    # --------------------------------------------------------
+    # OPTIMIZER
+    # --------------------------------------------------------
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=LEARNING_RATE,
+        weight_decay=1e-4
+    )
+
+    # --------------------------------------------------------
+    # LR SCHEDULER
+    # --------------------------------------------------------
+
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=EPOCHS,
+        eta_min=1e-6
+    )
+
+    # --------------------------------------------------------
+    # MIXED PRECISION
+    # --------------------------------------------------------
+
+    use_amp = (
+        device.type == "cuda"
+    )
+
+    scaler = torch.amp.GradScaler(
+        "cuda",
+        enabled=use_amp
+    )
+
+    # --------------------------------------------------------
+    # TRACK BEST MODEL
+    # --------------------------------------------------------
+
+    best_val_loss = float("inf")
+
+    total_start_time = time.time()
+
+    # ========================================================
+    # EPOCH LOOP
+    # ========================================================
+
+    for epoch in range(EPOCHS):
+
+        epoch_start = time.time()
+
+        # ====================================================
+        # TRAIN
+        # ====================================================
+
+        model.train()
+
+        train_total = 0.0
+        train_box = 0.0
+        train_obj = 0.0
+        train_cls = 0.0
+
+        for batch_index, (
+            images,
+            labels
+        ) in enumerate(train_loader):
+
+            images = images.to(
+                device,
+                non_blocking=True
+            )
+
+            optimizer.zero_grad(
+                set_to_none=True
+            )
+
+            # ------------------------------------------------
+            # Forward
+            # ------------------------------------------------
+
+            with torch.autocast(
+                device_type=device.type,
+                dtype=torch.float16,
+                enabled=use_amp
+            ):
+
+                output = model(images)
+
+                batch_size, _, grid_h, grid_w = (
+                    output.shape
+                )
+
+                target = build_targets(
+                    labels,
+                    batch_size,
+                    grid_h,
+                    grid_w,
+                    device
+                )
+
+                loss, box_loss, obj_loss, cls_loss = (
+                    detection_loss(
+                        output,
+                        target
+                    )
+                )
+
+            # ------------------------------------------------
+            # Backprop
+            # ------------------------------------------------
+
+            scaler.scale(
+                loss
+            ).backward()
+
+            scaler.unscale_(
+                optimizer
+            )
+
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                max_norm=10.0
+            )
+
+            scaler.step(
+                optimizer
+            )
+
+            scaler.update()
+
+            # ------------------------------------------------
+            # Statistics
+            # ------------------------------------------------
+
+            train_total += loss.item()
+            train_box += box_loss.item()
+            train_obj += obj_loss.item()
+            train_cls += cls_loss.item()
+
+            # ------------------------------------------------
+            # Progress
+            # ------------------------------------------------
+
+            if batch_index % 50 == 0:
+
+                print(
+                    f"Epoch {epoch + 1}/{EPOCHS} | "
+                    f"Batch {batch_index}/{len(train_loader)} | "
+                    f"Loss {loss.item():.4f}"
+                )
+
+        # ----------------------------------------------------
+        # Average training losses
+        # ----------------------------------------------------
+
+        avg_train = (
+            train_total /
+            len(train_loader)
+        )
+
+        avg_train_box = (
+            train_box /
+            len(train_loader)
+        )
+
+        avg_train_obj = (
+            train_obj /
+            len(train_loader)
+        )
+
+        avg_train_cls = (
+            train_cls /
+            len(train_loader)
+        )
+
+        # ====================================================
+        # VALIDATION
+        # ====================================================
+
+        model.eval()
+
+        val_total = 0.0
+
+        val_box = 0.0
+        val_obj = 0.0
+        val_cls = 0.0
+
+        with torch.no_grad():
+
+            for images, labels in val_loader:
+
+                images = images.to(
+                    device,
+                    non_blocking=True
+                )
+
+                with torch.autocast(
+                    device_type=device.type,
+                    dtype=torch.float16,
+                    enabled=use_amp
+                ):
+
+                    output = model(images)
+
+                    batch_size, _, grid_h, grid_w = (
+                        output.shape
+                    )
+
+                    target = build_targets(
+                        labels,
+                        batch_size,
+                        grid_h,
+                        grid_w,
+                        device
+                    )
+
+                    loss, box_loss, obj_loss, cls_loss = (
+                        detection_loss(
+                            output,
+                            target
+                        )
+                    )
+
+                val_total += loss.item()
+                val_box += box_loss.item()
+                val_obj += obj_loss.item()
+                val_cls += cls_loss.item()
+
+        avg_val = (
+            val_total /
+            len(val_loader)
+        )
+
+        avg_val_box = (
+            val_box /
+            len(val_loader)
+        )
+
+        avg_val_obj = (
+            val_obj /
+            len(val_loader)
+        )
+
+        avg_val_cls = (
+            val_cls /
+            len(val_loader)
+        )
+
+        # ----------------------------------------------------
+        # Scheduler
+        # ----------------------------------------------------
+
+        scheduler.step()
+
+        current_lr = (
+            optimizer.param_groups[0]["lr"]
+        )
+
+        # ----------------------------------------------------
+        # Timing
+        # ----------------------------------------------------
+
+        epoch_time = (
+            time.time() -
+            epoch_start
+        )
+
+        mins, secs = divmod(
+            epoch_time,
+            60
+        )
+
+        # ====================================================
+        # PRINT RESULTS
+        # ====================================================
+
+        print("\n" + "=" * 70)
 
         print(
-            "\nERROR: Could not open video."
+            f"Epoch [{epoch + 1}/{EPOCHS}]"
         )
-
-        return
-
-    fps = cap.get(
-        cv2.CAP_PROP_FPS
-    )
-
-    if fps <= 0:
-        fps = 30.0
-
-    total_frames = int(
-        cap.get(
-            cv2.CAP_PROP_FRAME_COUNT
-        )
-    )
-
-    width = int(
-        cap.get(
-            cv2.CAP_PROP_FRAME_WIDTH
-        )
-    )
-
-    height = int(
-        cap.get(
-            cv2.CAP_PROP_FRAME_HEIGHT
-        )
-    )
-
-    print(
-        f"Resolution: "
-        f"{width} × {height}"
-    )
-
-    print(
-        f"FPS: {fps:.2f}"
-    )
-
-    print(
-        f"Frames: {total_frames}"
-    )
-
-    # --------------------------------------------------------
-    # Output video
-    # --------------------------------------------------------
-
-    output_path = (
-        OUTPUT_DIR /
-        f"{video_path.stem}_result.mp4"
-    )
-
-    fourcc = cv2.VideoWriter_fourcc(
-        *"mp4v"
-    )
-
-    writer = cv2.VideoWriter(
-        str(output_path),
-        fourcc,
-        fps,
-        (width, height)
-    )
-
-    if not writer.isOpened():
 
         print(
-            "\nERROR: Could not create output video."
+            f"Train Loss: {avg_train:.4f}"
         )
 
-        cap.release()
-
-        return
-
-    # --------------------------------------------------------
-    # Process frames
-    # --------------------------------------------------------
-
-    frame_number = 0
-
-    print(
-        "\nStarting video detection...\n"
-    )
-
-    while True:
-
-        ret, frame = cap.read()
-
-        if not ret:
-            break
-
-        frame_number += 1
-
-        result = detect_frame(
-            frame
+        print(
+            f"  Box: {avg_train_box:.4f} | "
+            f"Obj: {avg_train_obj:.4f} | "
+            f"Cls: {avg_train_cls:.4f}"
         )
 
-        cv2.putText(
-            result,
-            f"Frame: "
-            f"{frame_number}/{total_frames}",
-            (20, 35),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (255, 255, 255),
-            2
+        print(
+            f"Val Loss:   {avg_val:.4f}"
         )
 
-        writer.write(
-            result
+        print(
+            f"  Box: {avg_val_box:.4f} | "
+            f"Obj: {avg_val_obj:.4f} | "
+            f"Cls: {avg_val_cls:.4f}"
         )
 
-        if frame_number % 30 == 0:
+        print(
+            f"Learning Rate: {current_lr:.8f}"
+        )
 
-            progress = (
-                frame_number /
-                total_frames *
-                100
+        print(
+            f"Epoch Time: {int(mins)}m {int(secs)}s"
+        )
+
+        # ====================================================
+        # SAVE BEST
+        # ====================================================
+
+        if avg_val < best_val_loss:
+
+            best_val_loss = avg_val
+
+            torch.save(
+                {
+                    "epoch": epoch + 1,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "val_loss": best_val_loss
+                },
+                BEST_MODEL_PATH
             )
 
             print(
-                f"Processing: "
-                f"{progress:.1f}% "
-                f"({frame_number}/{total_frames})"
+                f"\n[+] NEW BEST MODEL SAVED"
             )
 
-    cap.release()
-    writer.release()
+            print(
+                f"    Val Loss: {best_val_loss:.4f}"
+            )
+
+        # ====================================================
+        # SAVE LAST
+        # ====================================================
+
+        torch.save(
+            {
+                "epoch": epoch + 1,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "val_loss": avg_val
+            },
+            LAST_MODEL_PATH
+        )
+
+        print("=" * 70 + "\n")
+
+    # ========================================================
+    # COMPLETE
+    # ========================================================
+
+    total_minutes = (
+        time.time() -
+        total_start_time
+    ) / 60.0
 
     print(
-        "\nVideo detection complete!"
+        f"\nTraining complete!"
     )
 
     print(
-        f"Output video:\n"
-        f"{output_path}"
+        f"Total time: "
+        f"{total_minutes:.2f} minutes"
     )
 
+    print(
+        f"Best model: "
+        f"{BEST_MODEL_PATH}"
+    )
 
-# ============================================================
-# DETERMINE INPUT TYPE
-# ============================================================
 
 if __name__ == "__main__":
-
-    if not INPUT_PATH.exists():
-
-        print(
-            f"\nERROR: Input does not exist:\n"
-            f"{INPUT_PATH}"
-        )
-
-        raise SystemExit
-
-    # ========================================================
-    # RUN
-    # ========================================================
-
-    if INPUT_PATH.is_dir():
-
-        process_image_folder(
-            INPUT_PATH
-        )
-
-    elif INPUT_PATH.is_file():
-
-        extension = (
-            INPUT_PATH.suffix.lower()
-        )
-
-        if extension in IMAGE_EXTENSIONS:
-
-            process_image(
-                INPUT_PATH
-            )
-
-        elif extension in VIDEO_EXTENSIONS:
-
-            process_video(
-                INPUT_PATH
-            )
-
-        else:
-
-            print(
-                f"\nERROR: Unsupported file type:"
-                f" {extension}"
-            )
-
-    else:
-
-        print(
-            "\nERROR: Invalid input path."
-        )
-
-    # ========================================================
-    # FINISHED
-    # ========================================================
-
-    print(
-        "\n" + "=" * 60
-    )
-
-    print(
-        "DONE"
-    )
-
-    print(
-        "=" * 60
-    )
-
-    print(
-        f"Results saved in:\n"
-        f"{OUTPUT_DIR}"
-    )
+    main()
